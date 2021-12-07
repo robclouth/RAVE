@@ -250,7 +250,7 @@ class CachedPQMF(PQMF):
             stride=hkf.shape[0],
             bias=False,
         )
-        self.forward_conv.weight.data.copy_(hkf)
+        self.forward_conv.conv.weight.data.copy_(hkf)
 
         self.inverse_conv = Conv1d(
             hki.shape[1],
@@ -259,7 +259,7 @@ class CachedPQMF(PQMF):
             padding=get_padding(hki.shape[-1]),
             bias=False,
         )
-        self.inverse_conv.weight.data.copy_(hki)
+        self.inverse_conv.conv.weight.data.copy_(hki)
 
     def script_cache(self):
         self.forward_conv.script_cache()

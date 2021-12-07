@@ -1,10 +1,17 @@
 import torch
 import torch.nn as nn
-import torch.nn.utils.weight_norm as wn
+import torch.nn.quantized as qnn
+
+from time import sleep
+
 import numpy as np
 import pytorch_lightning as pl
+from torch.utils import data
+
 from .core import multiscale_stft, Loudness, mod_sigmoid
 from .core import amp_to_impulse_response, fft_convolve
+from .core import recursive_apply_weight_norm
+
 from .pqmf import CachedPQMF as PQMF
 from sklearn.decomposition import PCA
 from einops import rearrange
@@ -48,9 +55,11 @@ class Residual(nn.Module):
         )
         self.future_compensation = future
 
+        self.ff = qnn.FloatFunctional()
+
     def forward(self, x):
         x_net, x_res = self.aligned(x)
-        return x_net + x_res
+        return self.ff.add(x_net, x_res)
 
 
 class ResidualStack(nn.Module):
@@ -62,32 +71,31 @@ class ResidualStack(nn.Module):
                 Residual(
                     CachedSequential(
                         nn.LeakyReLU(.2),
-                        wn(
-                            Conv1d(
-                                dim,
-                                dim,
+                        Conv1d(
+                            dim,
+                            dim,
+                            kernel_size,
+                            padding=get_padding(
                                 kernel_size,
-                                padding=get_padding(
-                                    kernel_size,
-                                    dilation=3**i,
-                                    mode=padding_mode,
-                                ),
                                 dilation=3**i,
-                                bias=bias,
-                            )),
+                                mode=padding_mode,
+                            ),
+                            dilation=3**i,
+                            bias=bias,
+                        ),
                         nn.LeakyReLU(.2),
-                        wn(
-                            Conv1d(
-                                dim,
-                                dim,
-                                kernel_size,
-                                padding=get_padding(kernel_size,
-                                                    mode=padding_mode),
-                                bias=bias,
-                            )),
+                        Conv1d(
+                            dim,
+                            dim,
+                            kernel_size,
+                            padding=get_padding(kernel_size,
+                                                mode=padding_mode),
+                            bias=bias,
+                        ),
                     )))
 
         self.net = CachedSequential(*net)
+
         self.future_compensation = self.net.future_compensation
 
     def forward(self, x):
@@ -100,27 +108,26 @@ class UpsampleLayer(nn.Module):
         net = [nn.LeakyReLU(.2)]
         if ratio > 1:
             net.append(
-                wn(
-                    ConvTranspose1d(
-                        in_dim,
-                        out_dim,
-                        2 * ratio,
-                        stride=ratio,
-                        padding=ratio // 2,
-                        bias=bias,
-                    )))
+                ConvTranspose1d(
+                    in_dim,
+                    out_dim,
+                    2 * ratio,
+                    stride=ratio,
+                    padding=ratio // 2,
+                    bias=bias,
+                ))
         else:
             net.append(
-                wn(
-                    Conv1d(
-                        in_dim,
-                        out_dim,
-                        3,
-                        padding=get_padding(3, mode=padding_mode),
-                        bias=bias,
-                    )))
+                Conv1d(
+                    in_dim,
+                    out_dim,
+                    3,
+                    padding=get_padding(3, mode=padding_mode),
+                    bias=bias,
+                ))
 
         self.net = CachedSequential(*net)
+
         self.future_compensation = self.net.future_compensation
 
     def forward(self, x):
@@ -180,15 +187,16 @@ class Generator(nn.Module):
                  bias=False):
         super().__init__()
         net = [
-            wn(
-                Conv1d(
-                    latent_size,
-                    2**len(ratios) * capacity,
-                    7,
-                    padding=get_padding(7, mode=padding_mode),
-                    bias=bias,
-                ))
+            torch.quantization.QuantStub(),
+            Conv1d(
+                latent_size,
+                2**len(ratios) * capacity,
+                7,
+                padding=get_padding(7, mode=padding_mode),
+                bias=bias,
+            )
         ]
+
         for i, r in enumerate(ratios):
             in_dim = 2**(len(ratios) - i) * capacity
             out_dim = 2**(len(ratios) - i - 1) * capacity
@@ -196,24 +204,28 @@ class Generator(nn.Module):
             net.append(UpsampleLayer(in_dim, out_dim, r, padding_mode))
             net.append(ResidualStack(out_dim, 3, padding_mode))
 
-        self.net = CachedSequential(*net)
+        net.append(torch.quantization.DeQuantStub())
 
-        wave_gen = wn(
-            Conv1d(out_dim,
-                   data_size,
-                   7,
-                   padding=get_padding(7, mode=padding_mode),
-                   bias=bias))
+        net = CachedSequential(*net)
 
-        loud_gen = wn(
-            Conv1d(out_dim,
-                   1,
-                   2 * loud_stride + 1,
-                   stride=loud_stride,
-                   padding=get_padding(2 * loud_stride + 1,
-                                       loud_stride,
-                                       mode=padding_mode),
-                   bias=bias))
+        wave_gen = Conv1d(out_dim,
+                          data_size,
+                          7,
+                          padding=get_padding(7, mode=padding_mode),
+                          bias=bias)
+
+        loud_gen = Conv1d(out_dim,
+                          1,
+                          2 * loud_stride + 1,
+                          stride=loud_stride,
+                          padding=get_padding(2 * loud_stride + 1,
+                                              loud_stride,
+                                              mode=padding_mode),
+                          bias=bias)
+
+        recursive_apply_weight_norm(net)
+        recursive_apply_weight_norm(wave_gen)
+        recursive_apply_weight_norm(loud_gen)
 
         branches = [wave_gen, loud_gen]
 
@@ -227,12 +239,25 @@ class Generator(nn.Module):
             )
             branches.append(noise_gen)
 
+        self.net = net
         self.synth = AlignBranches(*branches)
         self.use_noise = use_noise
         self.loud_stride = loud_stride
 
+    def prepare_for_quantization(self):
+        self.net = torch.quantization.prepare(self.net)
+
+    def convert_to_quantized(self):
+        self.net = torch.quantization.convert(self.net)
+
+    def apply_qconfig(self, config):
+        self.net.qconfig = config
+
     def forward(self, x, add_noise: bool = True):
-        x = self.net(x)
+        # x = self.net(x)
+        for layer in self.net:
+            # print(layer.__class__.__name__)
+            x = layer(x)
 
         if self.use_noise:
             waveform, loudness, noise = self.synth(x)
@@ -251,6 +276,37 @@ class Generator(nn.Module):
         return waveform
 
 
+class NormalizedConv1d(nn.Module):
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 kernel_size,
+                 padding=0,
+                 stride=1,
+                 bias=True):
+        super().__init__()
+        conv = Conv1d(
+            in_dim,
+            out_dim,
+            kernel_size,
+            padding=padding,
+            stride=stride,
+            bias=bias,
+        )
+
+        self.cache = conv.cache
+        self.conv = conv.conv
+        self.norm = nn.BatchNorm1d(out_dim)
+
+        self.future_compensation = conv.future_compensation
+
+    def forward(self, x):
+        x = self.cache(x)
+        x = self.conv(x)
+        x = self.norm(x)
+        return x
+
+
 class Encoder(nn.Module):
     def __init__(self,
                  data_size,
@@ -260,22 +316,22 @@ class Encoder(nn.Module):
                  padding_mode,
                  bias=False):
         super().__init__()
-        net = [
-            Conv1d(data_size,
-                   capacity,
-                   7,
-                   padding=get_padding(7, mode=padding_mode),
-                   bias=bias)
-        ]
+        self.pre_net = NormalizedConv1d(data_size,
+                                        capacity,
+                                        7,
+                                        padding=get_padding(7,
+                                                            mode=padding_mode),
+                                        bias=bias)
+
+        net = [torch.quantization.QuantStub()]
 
         for i, r in enumerate(ratios):
             in_dim = 2**i * capacity
             out_dim = 2**(i + 1) * capacity
 
-            net.append(nn.BatchNorm1d(in_dim))
             net.append(nn.LeakyReLU(.2))
             net.append(
-                Conv1d(
+                NormalizedConv1d(
                     in_dim,
                     out_dim,
                     2 * r + 1,
@@ -285,22 +341,51 @@ class Encoder(nn.Module):
                 ))
 
         net.append(nn.LeakyReLU(.2))
-        net.append(
-            Conv1d(
-                out_dim,
-                2 * latent_size,
-                5,
-                padding=get_padding(5, mode=padding_mode),
-                groups=2,
-                bias=bias,
-            ))
+        net.append(torch.quantization.DeQuantStub())
 
         self.net = CachedSequential(*net)
-        self.future_compensation = self.net.future_compensation
+
+        self.post_net = Conv1d(
+            out_dim,
+            2 * latent_size,
+            5,
+            padding=get_padding(5, mode=padding_mode),
+            groups=2,
+            bias=bias,
+        )
+
+        self.future_compensation = sum([
+            m.future_compensation
+            for m in [self.pre_net, self.net, self.post_net]
+        ])
+
+    def prepare_for_quantization(self):
+        for module in self.net:
+            if module.__class__.__name__ == "NormalizedConv1d":
+                torch.quantization.fuse_modules(
+                    module,
+                    [["conv", "norm"]],
+                    True,
+                )
+        self.net = torch.quantization.prepare(self.net)
+
+    def convert_to_quantized(self):
+        self.net = torch.quantization.convert(self.net)
+
+    def apply_qconfig(self, config):
+        self.net.qconfig = config
 
     def forward(self, x):
-        z = self.net(x)
-        return torch.split(z, z.shape[1] // 2, 1)
+        # print("prenet")
+        x = self.pre_net(x)
+
+        for layer in self.net:
+            # print(layer.__class__.__name__)
+            x = layer(x)
+
+        # print("postnet")
+        x = self.post_net(x)
+        return torch.split(x, x.shape[1] // 2, 1)
 
 
 class Discriminator(nn.Module):
@@ -591,6 +676,19 @@ class RAVE(pl.LightningModule):
 
         return torch.cat([x, y], -1), mean
 
+    def forward(self, x):
+        if self.pqmf is not None:
+            x = self.pqmf(x)
+
+        mean, scale = self.encoder(x)
+        z, _ = self.reparametrize(mean, scale)
+        y = self.decoder(z, add_noise=self.warmed_up)
+
+        if self.pqmf is not None:
+            y = self.pqmf.inverse(y)
+
+        return y
+
     def validation_epoch_end(self, out):
         audio, z = list(zip(*out))
 
@@ -620,3 +718,15 @@ class RAVE(pl.LightningModule):
         y = torch.cat(audio[:64], 0).reshape(-1)
         self.logger.experiment.add_audio("audio_val", y, self.idx, self.sr)
         self.idx += 1
+
+    def prepare_for_quantization(self):
+        self.encoder.prepare_for_quantization()
+        self.decoder.prepare_for_quantization()
+
+    def convert_to_quantized(self):
+        self.encoder.convert_to_quantized()
+        self.decoder.convert_to_quantized()
+
+    def apply_qconfig(self, config):
+        self.encoder.apply_qconfig(config)
+        self.decoder.apply_qconfig(config)

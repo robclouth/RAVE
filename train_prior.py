@@ -1,17 +1,15 @@
-import torch
+from rave import is_gpu_available
 from torch.utils.data import random_split, DataLoader
 import pytorch_lightning as pl
 
 from prior.model import Model
 from effortless_config import Config
-from os import environ, path
+from os import path
 
 from udls import SimpleDataset, simple_audio_preprocess
 import numpy as np
 
 import math
-
-import GPUtil as gpu
 
 
 class args(Config):
@@ -84,22 +82,10 @@ validation_checkpoint = pl.callbacks.ModelCheckpoint(
 )
 last_checkpoint = pl.callbacks.ModelCheckpoint(filename="last")
 
-CUDA = gpu.getAvailable(maxMemory=.05)
-if len(CUDA):
-    environ["CUDA_VISIBLE_DEVICES"] = str(CUDA[0])
-    use_gpu = 1
-elif torch.cuda.is_available():
-    print("Cuda is available but no fully free GPU found.")
-    print("Training may be slower due to concurrent processes.")
-    use_gpu = 1
-else:
-    print("No GPU found.")
-    use_gpu = 0
-
 trainer = pl.Trainer(
     logger=pl.loggers.TensorBoardLogger(path.join("runs", args.NAME),
                                         name="prior"),
-    gpus=use_gpu,
+    gpus=is_gpu_available(),
     val_check_interval=min(10000, len(train)),
     callbacks=[validation_checkpoint, last_checkpoint],
     resume_from_checkpoint=args.CKPT,

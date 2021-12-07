@@ -10,6 +10,7 @@ import librosa as li
 import math
 from os import path
 from glob import glob
+import torch.nn.utils.weight_norm as weight_norm
 
 
 def mod_sigmoid(x):

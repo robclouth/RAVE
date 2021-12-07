@@ -3,14 +3,13 @@ from torch.utils.data import DataLoader, random_split
 
 from rave.model import RAVE
 from rave.core import random_phase_mangle, EMAModelCheckPoint
+from rave import is_gpu_available
 
 from udls import SimpleDataset, simple_audio_preprocess
 from effortless_config import Config
 import pytorch_lightning as pl
-from os import environ, path
+from os import path
 import numpy as np
-
-import GPUtil as gpu
 
 from udls.transforms import Compose, RandomApply, Dequantize, RandomCrop
 
@@ -107,22 +106,10 @@ if __name__ == "__main__":
                                         filename="ema",
                                         monitor="validation")
 
-    CUDA = gpu.getAvailable(maxMemory=.05)
-    if len(CUDA):
-        environ["CUDA_VISIBLE_DEVICES"] = str(CUDA[0])
-        use_gpu = 1
-    elif torch.cuda.is_available():
-        print("Cuda is available but no fully free GPU found.")
-        print("Training may be slower due to concurrent processes.")
-        use_gpu = 1
-    else:
-        print("No GPU found.")
-        use_gpu = 0
-
     trainer = pl.Trainer(
         logger=pl.loggers.TensorBoardLogger(path.join("runs", args.NAME),
                                             name="rave"),
-        gpus=use_gpu,
+        gpus=is_gpu_available(),
         val_check_interval=min(10000, len(train)),
         callbacks=[validation_checkpoint,
                    last_checkpoint],  #, ema_checkpoint],

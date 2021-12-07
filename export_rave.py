@@ -1,4 +1,6 @@
 import torch
+
+torch.set_grad_enabled(False)
 import torch.nn as nn
 from effortless_config import Config
 from glob import glob
@@ -6,6 +8,13 @@ from os import path
 import logging
 from termcolor import colored
 import cached_conv
+
+from tqdm import tqdm
+
+from udls import SimpleLMDBDataset
+from torch.utils.data import DataLoader
+
+from rave import is_gpu_available
 
 logging.basicConfig(level=logging.INFO,
                     format=colored("[%(relativeCreated).2f] ", "green") +
@@ -17,16 +26,24 @@ logging.info("exporting model")
 class args(Config):
     RUN = None
     SR = None
-    CACHED = False
+    CACHED = True
     FIDELITY = .95
     NAME = "vae"
+    OPTIMIZE = False
+    DATA_PATH = None
 
 
 args.parse_args()
+
+# args.override(OPTIMIZE=True,
+#               RUN="runs/darbouka_q_nl/rave",
+#               CACHED=True,
+#               NAME="darbouka_q_rt",
+#               DATA_PATH="/fast-1/tmp/darbouka_q_nl/rave/")
 cached_conv.use_buffer_conv(args.CACHED)
 
 from rave.model import RAVE
-from cached_conv import CachedConv1d, CachedConvTranspose1d, AlignBranches
+from cached_conv import CachedConv1d, CachedConvTranspose1d, AlignBranches, CachedPadding1d
 from rave.resample import Resampling
 from rave.pqmf import CachedPQMF
 from rave.core import search_for_run
@@ -149,7 +166,18 @@ class TraceModel(nn.Module):
         return x
 
     def forward(self, x):
-        return self.decode(self.encode(x))
+        # print(80 * "=")
+        # print("ENCODE")
+        # print(80 * "=")
+
+        x = self.encode(x)
+
+        # print(80 * "=")
+        # print("DECODE")
+        # print(80 * "=")
+
+        x = self.decode(x)
+        return x
 
 
 logging.info("loading model from checkpoint")
@@ -171,6 +199,47 @@ mean, scale = model.encoder(x)
 y = model.decoder(mean)
 if model.pqmf is not None:
     y = model.pqmf.inverse(y)
+
+if args.OPTIMIZE:
+    logging.info("optimization")
+    model.apply_qconfig(torch.quantization.get_default_qconfig('qnnpack'))
+
+    logging.info(" - gpu acceleration")
+    device = torch.device("cuda" if is_gpu_available() else "cpu")
+    model.to(device)
+
+    torch.backends.quantized.engine = 'qnnpack'
+
+    logging.info(" - preparing data for calibration")
+    assert args.DATA_PATH is not None, "You must provide a dataset in order to calibrate the model"
+    dataset = SimpleLMDBDataset(args.DATA_PATH)
+    assert len(dataset), "data path must be a valid lmdb dataset path"
+    dataloader = DataLoader(dataset, batch_size=1)
+
+    logging.info(" - model calibration")
+    model.prepare_for_quantization()
+
+    with torch.no_grad():
+        length = len(dataloader)
+        for i, audio in enumerate(dataloader):
+            model(audio.unsqueeze(1).to(device))
+            p = 100 * i / length
+            print(f" {p:.2f}%", end="\r")
+            if p > 1: break
+    model.cpu()
+
+    logging.info(" - model quantization")
+    model.convert_to_quantized()
+
+    for m in model.modules():
+        if m.__class__.__name__ == "CachedPadding1d":
+            m.initialized = 0
+
+    logging.info(" - populating buffers with quantized cache")
+    x = torch.zeros(1, 1, 2**14)
+    model(x)
+
+    args.NAME += "_q"
 
 logging.info("scripting cached modules")
 n_cache = 0
@@ -213,5 +282,7 @@ model = TraceModel(model, resample, args.FIDELITY)
 model(x)
 
 model = torch.jit.script(model)
+model(x)
+
 logging.info(f"save rave_{args.NAME}.ts")
 model.save(f"rave_{args.NAME}.ts")
