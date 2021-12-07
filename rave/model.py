@@ -2,15 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.quantized as qnn
 
-from time import sleep
-
 import numpy as np
 import pytorch_lightning as pl
 from torch.utils import data
 
 from .core import multiscale_stft, Loudness, mod_sigmoid
 from .core import amp_to_impulse_response, fft_convolve
-from .core import recursive_apply_weight_norm
 
 from .pqmf import CachedPQMF as PQMF
 from sklearn.decomposition import PCA
@@ -20,11 +17,10 @@ import math
 
 from time import time
 
-from cached_conv import USE_BUFFER_CONV, get_padding
-from cached_conv import CachedConv1d, CachedConvTranspose1d, Conv1d, CachedPadding1d, AlignBranches, CachedSequential
+import cached_conv as cc
 
-Conv1d = CachedConv1d if USE_BUFFER_CONV else Conv1d
-ConvTranspose1d = CachedConvTranspose1d if USE_BUFFER_CONV else nn.ConvTranspose1d
+Conv1d = cc.CachedConv1d if cc.USE_BUFFER_CONV else cc.Conv1d
+ConvTranspose1d = cc.CachedConvTranspose1d if cc.USE_BUFFER_CONV else cc.ConvTranspose1d
 
 
 class Profiler:
@@ -48,7 +44,7 @@ class Residual(nn.Module):
     def __init__(self, module):
         super().__init__()
         future = module.future_compensation
-        self.aligned = AlignBranches(
+        self.aligned = cc.AlignBranches(
             module,
             nn.Identity(),
             futures=[future, 0],
@@ -69,32 +65,34 @@ class ResidualStack(nn.Module):
         for i in range(3):
             net.append(
                 Residual(
-                    CachedSequential(
+                    cc.CachedSequential(
                         nn.LeakyReLU(.2),
                         Conv1d(
                             dim,
                             dim,
                             kernel_size,
-                            padding=get_padding(
+                            padding=cc.get_padding(
                                 kernel_size,
                                 dilation=3**i,
                                 mode=padding_mode,
                             ),
                             dilation=3**i,
                             bias=bias,
+                            weight_norm=True,
                         ),
                         nn.LeakyReLU(.2),
                         Conv1d(
                             dim,
                             dim,
                             kernel_size,
-                            padding=get_padding(kernel_size,
-                                                mode=padding_mode),
+                            padding=cc.get_padding(kernel_size,
+                                                   mode=padding_mode),
                             bias=bias,
+                            weight_norm=True,
                         ),
                     )))
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
 
         self.future_compensation = self.net.future_compensation
 
@@ -115,6 +113,7 @@ class UpsampleLayer(nn.Module):
                     stride=ratio,
                     padding=ratio // 2,
                     bias=bias,
+                    weight_norm=True,
                 ))
         else:
             net.append(
@@ -122,11 +121,12 @@ class UpsampleLayer(nn.Module):
                     in_dim,
                     out_dim,
                     3,
-                    padding=get_padding(3, mode=padding_mode),
+                    padding=cc.get_padding(3, mode=padding_mode),
                     bias=bias,
+                    weight_norm=True,
                 ))
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
 
         self.future_compensation = self.net.future_compensation
 
@@ -145,13 +145,14 @@ class NoiseGenerator(nn.Module):
                     channels[i],
                     channels[i + 1],
                     3,
-                    padding=get_padding(3, r, mode=padding_mode),
+                    padding=cc.get_padding(3, r, mode=padding_mode),
                     stride=r,
+                    weight_norm=True,
                 ))
             if i != len(ratios) - 1:
                 net.append(nn.LeakyReLU(.2))
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
         self.data_size = data_size
         self.future_compensation = self.net.future_compensation
 
@@ -192,8 +193,9 @@ class Generator(nn.Module):
                 latent_size,
                 2**len(ratios) * capacity,
                 7,
-                padding=get_padding(7, mode=padding_mode),
+                padding=cc.get_padding(7, mode=padding_mode),
                 bias=bias,
+                weight_norm=True,
             )
         ]
 
@@ -206,26 +208,26 @@ class Generator(nn.Module):
 
         net.append(torch.quantization.DeQuantStub())
 
-        net = CachedSequential(*net)
+        net = cc.CachedSequential(*net)
 
-        wave_gen = Conv1d(out_dim,
-                          data_size,
-                          7,
-                          padding=get_padding(7, mode=padding_mode),
-                          bias=bias)
+        wave_gen = Conv1d(
+            out_dim,
+            data_size,
+            7,
+            padding=cc.get_padding(7, mode=padding_mode),
+            bias=bias,
+            weight_norm=True,
+        )
 
         loud_gen = Conv1d(out_dim,
                           1,
                           2 * loud_stride + 1,
                           stride=loud_stride,
-                          padding=get_padding(2 * loud_stride + 1,
-                                              loud_stride,
-                                              mode=padding_mode),
-                          bias=bias)
-
-        recursive_apply_weight_norm(net)
-        recursive_apply_weight_norm(wave_gen)
-        recursive_apply_weight_norm(loud_gen)
+                          padding=cc.get_padding(2 * loud_stride + 1,
+                                                 loud_stride,
+                                                 mode=padding_mode),
+                          bias=bias,
+                          weight_norm=True)
 
         branches = [wave_gen, loud_gen]
 
@@ -240,7 +242,7 @@ class Generator(nn.Module):
             branches.append(noise_gen)
 
         self.net = net
-        self.synth = AlignBranches(*branches)
+        self.synth = cc.AlignBranches(*branches)
         self.use_noise = use_noise
         self.loud_stride = loud_stride
 
@@ -319,8 +321,8 @@ class Encoder(nn.Module):
         self.pre_net = NormalizedConv1d(data_size,
                                         capacity,
                                         7,
-                                        padding=get_padding(7,
-                                                            mode=padding_mode),
+                                        padding=cc.get_padding(
+                                            7, mode=padding_mode),
                                         bias=bias)
 
         net = [torch.quantization.QuantStub()]
@@ -335,7 +337,7 @@ class Encoder(nn.Module):
                     in_dim,
                     out_dim,
                     2 * r + 1,
-                    padding=get_padding(2 * r + 1, r, mode=padding_mode),
+                    padding=cc.get_padding(2 * r + 1, r, mode=padding_mode),
                     stride=r,
                     bias=bias,
                 ))
@@ -343,13 +345,13 @@ class Encoder(nn.Module):
         net.append(nn.LeakyReLU(.2))
         net.append(torch.quantization.DeQuantStub())
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
 
         self.post_net = Conv1d(
             out_dim,
             2 * latent_size,
             5,
-            padding=get_padding(5, mode=padding_mode),
+            padding=cc.get_padding(5, mode=padding_mode),
             groups=2,
             bias=bias,
         )
@@ -402,7 +404,7 @@ class Discriminator(nn.Module):
                     min(1024, capacity * multiplier**(i + 1)),
                     41,
                     stride=multiplier,
-                    padding=get_padding(41, multiplier),
+                    padding=cc.get_padding(41, multiplier),
                     groups=multiplier**(i + 1),
                 ))
             net.append(nn.LeakyReLU(.2))
@@ -412,7 +414,7 @@ class Discriminator(nn.Module):
                 min(1024, capacity * multiplier**(i + 1)),
                 min(1024, capacity * multiplier**(i + 1)),
                 5,
-                padding=get_padding(5),
+                padding=cc.get_padding(5),
             ))
         net.append(nn.LeakyReLU(.2))
         net.append(Conv1d(min(1024, capacity * multiplier**(i + 1)), 1, 1))
