@@ -682,6 +682,7 @@ class GeneratorV2(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
+        x = torch.dropout(x, 0.5, self.training)
         noise = 0.
 
         if self.noise_module is not None:
